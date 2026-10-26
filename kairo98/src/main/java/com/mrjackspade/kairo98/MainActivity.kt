@@ -16,6 +16,7 @@ import com.mrjackspade.kairo.frontend.ExternalGameFile
 import com.mrjackspade.kairo.frontend.FirmwareSet
 import com.mrjackspade.kairo.frontend.FolderStateSlots
 import com.mrjackspade.kairo.frontend.GameDisks
+import com.mrjackspade.kairo.frontend.GameKey
 import com.mrjackspade.kairo.frontend.GameKeyMigration
 import com.mrjackspade.kairo.frontend.GameNotice
 import com.mrjackspade.kairo.frontend.GameSettingsRows
@@ -289,13 +290,16 @@ class MainActivity : MachineActivity<DiskImageEntry>() {
     private val manualFloppies = arrayOfNulls<File>(2)
     /** The disc in the CD-ROM drive, by file name. */
     private var mountedCd: String? = null
-    /** The running game uses a FONT.BMP from its own folder instead of the global one. */
-    private var gameFontActive = false
+    /** Where the running game's FONT.BMP comes from when it is not the global one: "Game setting" or "Game folder". */
+    private var gameFontSource: String? = null
+    /** The game whose Font row is waiting for the file the player picks. */
+    private var pickingGameFont: DiskImageEntry? = null
+    @Volatile private var gameFontImporting = false
     private val gameFonts by lazy { GameFontLocator(contentResolver, File(filesDir, "game-font.bmp")) }
     private var selectedStartup = emptyList<Pair<StartupChoice, StartupOption>>()
     /** Media a launch prepared, which the session takes once the game starts. */
     private class PreparedLaunch(val bootFloppy: DiskImageEntry?, val floppyB: DiskImageEntry?,
-                                 val swapSources: Map<String, DiskImageEntry>, val gameFont: Boolean,
+                                 val swapSources: Map<String, DiskImageEntry>, val gameFont: String?,
                                  val cd: DiskImageEntry?,
                                  /** What started: the launched entry, or a CD's boot disk. */
                                  val boot: DiskImageEntry)
@@ -385,14 +389,17 @@ class MainActivity : MachineActivity<DiskImageEntry>() {
         val bootFloppy = media?.bootFloppy?.let { disks.prepare(it, cancelled, progress) }
         val secondFloppy = floppyB?.let { disks.prepare(it, cancelled, progress) }
         val disc = cd?.let { disks.prepare(it, cancelled, progress) }
-        val gameFont = gameFonts.prepare(primary, if (external) null else tree,
+        // A font the player chose in Game settings wins, then a FONT.BMP beside the game, then the global font.
+        val chosenFont = gameFontFile(entry).takeIf { it.isFile }
+        val folderFont = if (chosenFont != null) null else gameFonts.prepare(primary, if (external) null else tree,
             disks.takeIf { primary.zipEntry != null }, cancelled)
-        val font = gameFont?.absolutePath ?: prepareFont()
+        val font = (chosenFont ?: folderFont)?.absolutePath ?: prepareFont()
+        val fontSource = if (chosenFont != null) "Game setting" else if (folderFont != null) "Game folder" else null
         check(startMachine(disk.absolutePath, font, game.baseClockTenthsMHz ?: clock, game.gdcClockTenthsMHz ?: 50,
             game.cpuMultiple ?: DEFAULT_CPU_MULTIPLE, primary.isFloppy, bootFloppy?.absolutePath,
             secondFloppy?.absolutePath, disc?.absolutePath)) { "Unable to start machine" }
         awaitMachineReady()?.let(::error)
-        prepared = PreparedLaunch(media?.bootFloppy, floppyB, swapSources, gameFont != null, cd, boot)
+        prepared = PreparedLaunch(media?.bootFloppy, floppyB, swapSources, fontSource, cd, boot)
     }
 
     private fun awaitMachineReady(): String? {
@@ -408,7 +415,7 @@ class MainActivity : MachineActivity<DiskImageEntry>() {
     override fun gameStarted(entry: DiskImageEntry, game: CatalogGame) {
         val launched = checkNotNull(prepared) { "The launch prepared no media" }
         prepared = null
-        gameFontActive = launched.gameFont
+        gameFontSource = launched.gameFont
         val booted = launched.boot
         currentIsFloppy = launched.bootFloppy == null && booted.isFloppy
         mountedFloppies[0] = launched.bootFloppy?.displayName ?: if (booted.isFloppy) booted.displayName else null
@@ -422,7 +429,7 @@ class MainActivity : MachineActivity<DiskImageEntry>() {
     override fun sessionEnded() {
         super.sessionEnded()
         prepared = null
-        gameFontActive = false
+        gameFontSource = null
         currentIsFloppy = false
         mountedFloppies.fill(null)
         manualFloppies.fill(null)
@@ -854,7 +861,7 @@ class MainActivity : MachineActivity<DiskImageEntry>() {
                 setOf("bios.rom"), false, setOf(BIOS_ROM_BYTES)),
             FirmwareSet.Part("font.bmp", "Font", "font.bmp · the text and kanji font; Kairo98 has a built-in one",
                 setOf("font.bmp"), false, maxBytes = Pc98FontBitmap.MAX_BYTES, validate = Pc98FontBitmap::validate,
-                status = { if (gameFontActive) "Game folder" else null }, missing = "Built-in",
+                status = { gameFontSource }, missing = "Built-in",
                 removeLabel = "Use built-in"),
             FirmwareSet.Part("ym2608_adpcm_rom.bin", "Rhythm samples",
                 "ym2608_adpcm_rom.bin · the sound board's drum sounds", setOf("ym2608_adpcm_rom.bin"), false,
@@ -887,6 +894,74 @@ class MainActivity : MachineActivity<DiskImageEntry>() {
             nativeClock(clock)
             toast("Clock change resets the machine")
         } else toast("Global clock saved; this game uses its own clock")
+    }
+
+    // Per-game font ----------------------------------------------------------------------------------
+
+    /** The FONT.BMP the player chose for [entry] in Game settings; it exists only while one is chosen. */
+    private fun gameFontFile(entry: DiskImageEntry) =
+        File(File(filesDir, GAME_FONT_DIR), "${entry.key.storageName}.bmp")
+
+    /** Game settings › MACHINE, with a Font row after the catalog's rows. */
+    override fun machineGroup(entry: DiskImageEntry, enabled: () -> Boolean): RowGroup? {
+        val base = super.machineGroup(entry, enabled)
+        val font = gameFontRow(entry, enabled)
+        return if (base == null) RowGroup("MACHINE", listOf(font), GAME_FONT_NOTE)
+        else RowGroup(base.label, base.rows + font, base.foot)
+    }
+
+    /** The game's own FONT.BMP: Default uses the game's folder or the all-games font. */
+    private fun gameFontRow(entry: DiskImageEntry, enabled: () -> Boolean): SettingsRow {
+        val file = gameFontFile(entry)
+        return SettingsRow.action("game-font", "Font",
+            value = { if (file.isFile) "Custom" else "Default" },
+            tone = { if (file.isFile) ValueTone.CURRENT else ValueTone.EMPTY },
+            description = "A FONT.BMP used only for this game",
+            busy = { gameFontImporting },
+            enabled = { enabled() && !gameFontImporting },
+            disabledReason = { if (gameFontImporting) "Wait for the font import to finish" else GameSettingsRows.NO_HASH },
+            tray = {
+                val choose = TrayButton(if (file.isFile) "Replace…" else "Choose file…", ButtonTone.PRIMARY) {
+                    pickingGameFont = entry
+                    DocumentPicker.open(this, GAME_FONT_REQUEST, failed = ::toast)
+                }
+                TraySpec(buttons = if (file.isFile) listOf(TrayButton("Use default") {
+                    saveGameSetting(entry) { check(!file.exists() || file.delete()) { "Could not remove the font" } }
+                }, choose) else listOf(choose))
+            })
+    }
+
+    /** Copies the picked file in as [entry]'s font once it passes the FONT.BMP checks. */
+    private fun importGameFont(entry: DiskImageEntry, uri: Uri) {
+        gameFontImporting = true
+        pages.refresh()
+        Thread {
+            val failure = try {
+                FirmwareSet.importFile(contentResolver, uri, gameFontFile(entry), "Font",
+                    maxBytes = Pc98FontBitmap.MAX_BYTES, validate = Pc98FontBitmap::validate)
+                null
+            } catch (error: Exception) {
+                "Font import failed: ${error.message ?: error.javaClass.simpleName}"
+            }
+            runOnUiThread {
+                gameFontImporting = false
+                if (failure == null) saveGameSetting(entry) {} else {
+                    toast(failure)
+                    pages.refresh()
+                }
+            }
+        }.apply { name = "kairo98-game-font"; start() }
+    }
+
+    /** Reset returns the game to the default font too. */
+    override fun resetGameSettings(game: GameKey) {
+        super.resetGameSettings(game)
+        File(File(filesDir, GAME_FONT_DIR), "${game.storageName}.bmp").delete()
+    }
+
+    override fun deleteSource(entry: DiskImageEntry) {
+        super.deleteSource(entry)
+        gameFontFile(entry).delete()
     }
 
     /** The rows of Kairo98's own catalog settings (Pc98Catalog.settings). */
@@ -952,6 +1027,13 @@ class MainActivity : MachineActivity<DiskImageEntry>() {
     }
 
     override fun handleProductResult(requestCode: Int, resultCode: Int, data: Intent?): Boolean {
+        if (requestCode == GAME_FONT_REQUEST) {
+            val entry = pickingGameFont
+            pickingGameFont = null
+            val uri = DocumentPicker.selectedUri(resultCode, data)
+            if (entry != null && uri != null) importGameFont(entry, uri)
+            return true
+        }
         // Firmware picks belong to the shared firmware rows.
         if (requestCode !in HDI_REQUEST..FLOPPY_B_REQUEST) return super.handleProductResult(requestCode, resultCode, data)
         val uri = DocumentPicker.selectedUri(resultCode, data) ?: return true
@@ -1082,6 +1164,10 @@ class MainActivity : MachineActivity<DiskImageEntry>() {
         private const val HDI_REQUEST = FIRST_PRODUCT_REQUEST
         private const val FLOPPY_A_REQUEST = FIRST_PRODUCT_REQUEST + 1
         private const val FLOPPY_B_REQUEST = FIRST_PRODUCT_REQUEST + 2
+        private const val GAME_FONT_REQUEST = FIRST_PRODUCT_REQUEST + 3
+        /** Fonts chosen in Game settings, one file per game key, under filesDir. */
+        private const val GAME_FONT_DIR = "game-fonts"
+        private const val GAME_FONT_NOTE = "Machine changes apply on the next launch or restart."
         private const val BIOS_ROM_BYTES = 0x18000L
         private const val RHYTHM_ROM_BYTES = 0x2000L
         init { System.loadLibrary("kairo98") }
