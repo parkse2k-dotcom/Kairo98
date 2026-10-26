@@ -1,0 +1,26 @@
+name: Build APK
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out the pinned Kairo frontend
+        run: |
+          git submodule update --init --recursive shared
+          bash shared/tools/verify_checkout.sh "$(git rev-parse HEAD:shared)"
+      - uses: ./shared/.github/actions/setup-android
+      - name: Build the debug APK
+        run: ./gradlew --no-daemon ":kairo98:assembleWithoutImagesDebug"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kairo98-debug-apk
+          path: kairo98/build/outputs/apk/withoutImages/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
